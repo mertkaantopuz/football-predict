@@ -1,8 +1,16 @@
+# Sanal ortam, önbellek, editör ayarları
 .venv/
 __pycache__/
 *.pyc
 .vscode/
+
+# API anahtarları ve gizli ayarlar: ASLA GitHub'a gitmesin
 .env
+
+# Veri klasörü: büyük/lisanslı dosyalar (sqlite, xlsx, ham csv) dışarıda kalır,
+# yalnızca uygulamanın okuduğu iki dosya takip edilir
 data/*
 !data/predictions_predict.csv
+!data/predictions_????-??-??.csv
 !data/model_results.csv
+!data/predictions_????-??-??.csv
