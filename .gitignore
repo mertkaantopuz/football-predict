@@ -8,9 +8,10 @@ __pycache__/
 .env
 
 # Veri klasörü: büyük/lisanslı dosyalar (sqlite, xlsx, ham csv) dışarıda kalır,
-# yalnızca uygulamanın okuduğu iki dosya takip edilir
+# yalnızca uygulamanın okuduğu tahmin/sonuç dosyaları takip edilir
 data/*
 !data/predictions_predict.csv
 !data/predictions_????-??-??.csv
+!data/poisson_predictions_????-??-??.csv
+!data/poisson_results.csv
 !data/model_results.csv
-!data/predictions_????-??-??.csv
