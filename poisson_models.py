@@ -15,7 +15,6 @@ Kullanım (train_models.py ile aynı klasörde):
 """
 import logging
 from datetime import datetime
-from turtle import stamp
 from zoneinfo import ZoneInfo
 
 import numpy as np

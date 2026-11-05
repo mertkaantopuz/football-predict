@@ -616,6 +616,13 @@ def main():
                      grp["kickoff_dt"].min().date(), grp["kickoff_dt"].max().date(),
                      100 * grp["hist_ok"].mean())
 
+    done = out[out["split"].isin(["train", "valid", "test"])]
+    lg = done.groupby(["country", "league"]).agg(
+        mac=("match_id", "size"), hist_ok=("hist_ok", "mean"),
+        ilk=("kickoff_dt", "min"), son=("kickoff_dt", "max"))
+    lg["hist_ok"] = (100 * lg["hist_ok"]).round(0).astype(int).astype(str) + "%"
+    logging.info("Lig bazında özet (train/valid/test):\n%s", lg.to_string())
+
 
 if __name__ == "__main__":
     main()

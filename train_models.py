@@ -220,8 +220,6 @@ def main():
         P = proba(model, X[te], k)
 
         prior = np.bincount(y[tr], minlength=k) / tr.sum()
-
-        prior = np.bincount(y[tr], minlength=k) / tr.sum()
         prior = np.clip(prior, 1e-6, None)
         P0 = np.tile(prior / prior.sum(), (te.sum(), 1))
         labels = list(range(k))

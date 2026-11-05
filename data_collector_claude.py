@@ -15,6 +15,8 @@ Kullanım:
     python data_collector.py                        -> bir kez güncelle
     python data_collector.py --watch --interval 6   -> 6 saatte bir güncelle
     python data_collector.py --refresh-history      -> geçmiş sezonları da yeniden tara
+    python data_collector.py --list-leagues         -> 1. dalga ülkelerinin katalogdaki lig ID'lerini listele
+    python data_collector.py --list-leagues Greece  -> katalogda 'Greece' geçen ligleri listele
 
 Çıktılar (data/ klasörü):
     football_data.sqlite   -> asıl veri (matches, match_stats tabloları)
@@ -34,7 +36,9 @@ Notlar:
 
 import os
 import re
+import json
 import time
+import unicodedata
 import logging
 import sqlite3
 import argparse
@@ -127,9 +131,49 @@ LEAGUES = [
     {"country": "Europe", "name": "Champions League", "id": "l_0bfbkO"},
 
     # Bu ikisinin ID'si /leagues kataloğundan bulunur
-    {"country": "Europe", "name": "Europa League", "id": None},
-    {"country": "Europe", "name": "Conference League", "id": None},
+    {"country": "Europe", "name": "Europa League", "id": "l_38d9HA"},
+    {"country": "Europe", "name": "Conference League", "id": "l_2WZ2tt"},
 ]
+
+
+# -------------------- 1. DALGA: YENİ ÜLKELERİN EN ÜST LİGLERİ --------------------
+# Yalnızca bu sezonlar çekilir. Eski ligler SEASONS'ın tamamını kullanmaya devam eder.
+WAVE1_SEASONS = ["2024/2025", "2025/2026", CURRENT_SEASON]
+
+# id=None -> /leagues kataloğundan ülke + isimle çözülür, OUTPUT_DIR/league_ids.json'a kaydedilir.
+# Bir lig bulunamaz ya da yanlış bulunursa ID'yi buraya elle yazın (en güvenilir yol).
+# aliases: katalogdaki olası adlar | exclude: yanlış eşleşmeyi engelleyen kelimeler (alt ligler vb.)
+WAVE1_LEAGUES = [
+    {"country": "Netherlands", "name": "Eredivisie", "id": "l_4H43wr",
+     "aliases": ["eredivisie"],
+     "exclude": ["eerste divisie", "keuken kampioen divisie"]},
+    {"country": "Portugal", "name": "Primeira Liga", "id": "l_4QexZg",
+     "aliases": ["primeira liga", "liga portugal betclic", "liga portugal bwin", "liga portugal"],
+     "exclude": ["2", "3", "segunda", "sabseg"]},
+    {"country": "Belgium", "name": "Pro League", "id": "l_2L6d1F",
+     "aliases": ["jupiler pro league", "belgian pro league", "pro league", "first division a"],
+     "exclude": ["challenger", "first division b", "b", "proximus"]},
+    {"country": "Czech Republic", "name": "Czech First League", "id": "l_0F4I4F",
+     "aliases": ["fortuna liga", "chance liga", "czech first league", "first league", "1 liga"],
+     "exclude": ["2 liga", "fnl", "narodni", "druha liga"]},
+    {"country": "Greece", "name": "Super League 1", "id": "l_3xwVF2",
+     "aliases": ["super league 1", "super league greece", "greek super league", "stoiximan super league", "super league"],
+     "exclude": ["2", "challenge", "football league", "gamma"]},
+    {"country": "Austria", "name": "Austrian Bundesliga", "id": "l_3zsMpo",
+     "aliases": ["austrian bundesliga", "admiral bundesliga", "tipico bundesliga", "bundesliga"],
+     "exclude": ["2", "2 liga", "regionalliga", "damen"]},
+    {"country": "Scotland", "name": "Scottish Premiership", "id": None,
+     "aliases": ["scottish premiership", "spfl premiership", "cinch premiership", "premiership"],
+     "exclude": ["championship", "league one", "league two", "u20"]},
+]
+for _lg in WAVE1_LEAGUES:
+    _lg["seasons"] = WAVE1_SEASONS
+LEAGUES.extend(WAVE1_LEAGUES)
+
+
+def league_seasons(league):
+    """Lig için çekilecek sezonlar: ligde 'seasons' varsa o, yoksa genel SEASONS."""
+    return league.get("seasons") or SEASONS
 
 
 # -------------------- HTTP YARDIMCISI --------------------
@@ -179,72 +223,157 @@ def api_get(url, params=None):
 
 # -------------------- LİG ID'LERİNİ TAMAMLA --------------------
 
+ID_CACHE_PATH = OUTPUT_DIR / "league_ids.json"
+
+COUNTRY_ALIASES = {
+    "Czech Republic": ["czech republic", "czechia"],
+    "Netherlands": ["netherlands", "holland"],
+}
+GENERIC_EXCLUDE = [
+    "women", "womens", "feminina", "feminin", "vrouwen", "youth", "reserves",
+    "u17", "u18", "u19", "u21", "u23", "qualification", "qualifiers",
+    "cup", "super cup", "play off", "play offs",
+]
+
+
+def _norm(text):
+    t = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", t).strip()
+
+
+def _has(text, phrase):
+    """Kelime sınırlı içerme: 'liga portugal 2' içinde '2' var, 'liga portugal' içinde yok."""
+    return f" {phrase} " in f" {text} "
+
+
 def normalize_name(name):
-    return (
-        str(name).lower()
-        .replace("uefa ", "")
-        .replace("'", "")
-        .replace("-", " ")
-        .strip()
-    )
+    return _norm(str(name).lower().replace("uefa ", ""))
+
+
+def _country_raw(league):
+    for key in ("country", "country_name", "nation", "region", "category"):
+        v = league.get(key)
+        if isinstance(v, dict):
+            v = v.get("name")
+        if v:
+            return str(v)
+    return None
+
+
+def _load_id_cache():
+    try:
+        return json.loads(ID_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_id_cache(cache):
+    ID_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def fetch_catalog():
+    """/leagues kataloğunu (varsa sayfalayarak) döndürür. Hata olursa []."""
+    out, seen = [], set()
+    for page in range(1, MAX_PAGES + 1):
+        data = api_get(f"{BASE_URL}/leagues", params={"page": page} if page > 1 else None)
+        if not data:
+            break
+        items = data.get("leagues", []) or []
+        new = [x for x in items if x.get("id") not in seen]
+        if not new:
+            break
+        seen.update(x.get("id") for x in new)
+        out.extend(new)
+        pg = data.get("pagination") or {}
+        total = pg.get("total_pages") or pg.get("pages")
+        if (total and page >= int(total)) or pg.get("has_next") is False or pg.get("has_more") is False:
+            break
+    return out
+
+
+def find_catalog_match(item, catalog):
+    """Dönüş: (lig_kaydı | None, aday_listesi). Belirsizlikte None döner (yanlış lig eklenmesin)."""
+    c_aliases = [_norm(a) for a in COUNTRY_ALIASES.get(item["country"], [item["country"]])]
+    aliases = [_norm(a) for a in item.get("aliases", [item["name"]])]
+    excl = [_norm(x) for x in GENERIC_EXCLUDE + item.get("exclude", [])]
+
+    cands = {}
+    for lg in catalog:
+        n = _norm(lg.get("name", ""))
+        if not n or any(_has(n, x) for x in excl):
+            continue
+        raw = _country_raw(lg)
+        if raw is not None and not any(_has(_norm(raw), a) for a in c_aliases):
+            continue
+        score = 2 if n in aliases else (1 if any(_has(n, a) for a in aliases) else 0)
+        if score:
+            cands[lg.get("id")] = (score, raw is not None, lg)
+
+    if not cands:
+        return None, []
+    top = max(v[0] for v in cands.values())
+    best = [v for v in cands.values() if v[0] == top]
+    if len(best) == 1:
+        return best[0][2], best
+    return None, best
 
 
 def resolve_european_league_ids():
-    """Europa League ve Conference League ID'lerini katalogdan bulur."""
-    if all(item["id"] for item in LEAGUES):
-        return
+    """id'si boş ligleri önce league_ids.json'dan, sonra /leagues kataloğundan çözer.
+    Çözülemeyen ligler bu çalıştırmada atlanır (eski ligler etkilenmez)."""
+    cache = _load_id_cache()
+    for it in LEAGUES:
+        if not it["id"]:
+            it["id"] = cache.get(f"{it['country']}|{it['name']}")
 
-    catalog_data = api_get(f"{BASE_URL}/leagues")
-    if not catalog_data:
-        raise RuntimeError("PitchAPI /leagues kataloğu alınamadı.")
+    pending = [it for it in LEAGUES if not it["id"]]
+    if pending:
+        catalog = fetch_catalog()
+        if not catalog:
+            logging.error("PitchAPI /leagues kataloğu alınamadı; ID'si olmayan ligler atlanıyor: %s",
+                          [it["name"] for it in pending])
+        for it in pending:
+            lg, cands = find_catalog_match(it, catalog)
+            if lg:
+                it["id"] = lg.get("id")
+                cache[f"{it['country']}|{it['name']}"] = it["id"]
+                logging.info("Lig ID bulundu: %s / %s -> %s (katalog adı: %s, ülke: %s)",
+                             it["country"], it["name"], it["id"], lg.get("name"), _country_raw(lg))
+            elif cands:
+                logging.error(
+                    "%s / %s için birden fazla aday var, ATLANDI. ID'yi WAVE1_LEAGUES'e elle yazın: %s",
+                    it["country"], it["name"],
+                    [(c[2].get("id"), c[2].get("name"), _country_raw(c[2])) for c in cands])
+            elif catalog:
+                logging.error("%s / %s katalogda bulunamadı, ATLANDI. "
+                              "'python data_collector_claude.py --list-leagues %s' ile bakın.",
+                              it["country"], it["name"], it["country"])
+        _save_id_cache(cache)
 
-    catalog = catalog_data.get("leagues", [])
-
-    aliases = {
-        "Europa League": ["europa league"],
-        "Conference League": ["conference league"],
-    }
-    # Yanlış eşleşmeleri engellemek için dışlanan kelimeler
-    excluded = ["women", "youth", "u19", "u21", "u17", "qualif", "super cup"]
-
-    for item in LEAGUES:
-        if item["id"]:
-            continue
-
-        target = item["name"]
-        candidates = aliases.get(target, [normalize_name(target)])
-        found = None
-
-        for league in catalog:
-            api_name = normalize_name(league.get("name", ""))
-            if any(x in api_name for x in excluded):
-                continue
-            if target == "Europa League" and "conference" in api_name:
-                continue
-            if any(alias in api_name for alias in candidates):
-                found = league
-                break
-
-        if found:
-            item["id"] = found.get("id")
-            item["api_name"] = found.get("name")
-            logging.info("Lig ID bulundu: %s -> %s (%s)",
-                         target, item["id"], item["api_name"])
-        else:
-            logging.error(
-                "%s katalogda bulunamadı. Olası UEFA/Avrupa ligleri: %s",
-                target,
-                [x.get("name") for x in catalog
-                 if "uefa" in x.get("name", "").lower()
-                 or "europe" in x.get("name", "").lower()]
-            )
-
-    missing = [x["name"] for x in LEAGUES if not x["id"]]
+    missing = [f"{it['country']}/{it['name']}" for it in LEAGUES if not it["id"]]
     if missing:
-        raise RuntimeError(
-            "Şu liglerin ID'si çözümlenemedi: " + ", ".join(missing)
-            + ". Katalogdaki isimleri kontrol edin."
-        )
+        logging.warning("ID'si olmayan, bu turda atlanacak ligler: %s", ", ".join(missing))
+    LEAGUES[:] = [it for it in LEAGUES if it["id"]]
+
+
+def list_catalog(text=""):
+    """--list-leagues: katalogdan lig ID'lerini yazdırır (ID doğrulamak için)."""
+    catalog = fetch_catalog()
+    print("Katalogdaki toplam lig:", len(catalog))
+    if catalog:
+        print("Örnek kayıt alanları:", list(catalog[0].keys()))
+    if text:
+        keys = [_norm(text)]
+    else:
+        keys = [_norm(x) for it in WAVE1_LEAGUES
+                for x in COUNTRY_ALIASES.get(it["country"], [it["country"]]) + it["aliases"]]
+    rows = []
+    for lg in catalog:
+        hay = _norm(f"{lg.get('name', '')} {_country_raw(lg) or ''}")
+        if any(_has(hay, k) for k in keys):
+            rows.append((_country_raw(lg) or "-", str(lg.get("name")), str(lg.get("id"))))
+    for c, n, i in sorted(rows):
+        print(f"{i:<12} | {c:<18} | {n}")
 
 
 # -------------------- TEST --------------------
@@ -961,6 +1090,8 @@ def update_once(refresh_history=False, seasons=None):
     new_rows = []
     for season in seasons:
         for idx, league in enumerate(LEAGUES, start=1):
+            if season not in league_seasons(league):
+                continue  # bu lig için bu sezon istenmiyor (1. dalga: yalnızca 2024/25+)
             final_key = ("season_final", f"{season}|{league['id']}")
             if season != CURRENT_SEASON:
                 if log.get(final_key):
@@ -1072,6 +1203,8 @@ def parse_args():
                         help="Tek lig/sezon için API cevap yapısını test et")
     parser.add_argument("--refresh-history", action="store_true",
                         help="Geçmiş sezonları da yeniden tara")
+    parser.add_argument("--list-leagues", nargs="?", const="", default=None, metavar="METİN",
+                        help="Katalogdaki lig ID'lerini listele (boşsa 1. dalga ülkeleri)")
     parser.add_argument("--seasons", nargs="+", default=None,
                         help="Sadece bu sezonları çek. Örn: --seasons 2025/2026 2026/2027")
     return parser.parse_args()
@@ -1083,6 +1216,10 @@ def main():
         format="%(asctime)s | %(levelname)s | %(message)s"
     )
     args = parse_args()
+
+    if args.list_leagues is not None:
+        list_catalog(args.list_leagues)
+        return
 
     if args.test:
         test_api()
