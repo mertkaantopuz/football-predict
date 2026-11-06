@@ -40,8 +40,7 @@ import lightgbm as lgb
 from sklearn.metrics import log_loss
 from sklearn.preprocessing import LabelEncoder
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.getenv("OUTPUT_DIR", "data"))
 
 # hedef adı -> sütun adı (features.csv içinde ya da aşağıda türetilir)
 TARGETS = {
@@ -66,35 +65,27 @@ TARGETS = {
     "korner_ust_10_5": "corners_o10_5",
 }
 
+# Daha güçlü regülarizasyon (eski: num_leaves=15, min_data_in_leaf=60, lambda_l2=10, lr=0.03)
 PARAMS = dict(
-    learning_rate=0.03,
-    num_leaves=15,
-    min_data_in_leaf=60,
+    learning_rate=0.02,
+    num_leaves=8,
+    max_depth=4,
+    min_data_in_leaf=120,
     feature_fraction=0.5,
     bagging_fraction=0.8,
     bagging_freq=1,
-    lambda_l2=10.0,
+    lambda_l1=5.0,
+    lambda_l2=30.0,
+    min_gain_to_split=0.0,
     verbosity=-1,
     seed=42,
 )
-
-HALF_LIFE_DAYS = float(os.getenv("HALF_LIFE_DAYS", "0"))  # 0 = ağırlık yok
-
-
-def time_weights(kickoff, ref, half_life=None):
-    """Maç yaşına göre üstel ağırlık (ortalaması 1'e normalize). half_life<=0 -> None."""
-    hl = HALF_LIFE_DAYS if half_life is None else half_life
-    if not hl or hl <= 0:
-        return None
-    age = (ref - pd.to_datetime(kickoff)).dt.total_seconds().to_numpy() / 86400.0
-    w = 0.5 ** (np.clip(age, 0, None) / hl)
-    return w / w.mean()
+EARLY_STOP = 150
 
 
 def load():
     df = pd.read_csv(DATA_DIR / "features.csv", low_memory=False, encoding="utf-8-sig")
     df["match_id"] = df["match_id"].astype(str)
-    df["kickoff_dt"] = pd.to_datetime(df["kickoff_dt"], errors="coerce")
 
     # türetilmiş hedefler
     if "total_goals" in df.columns:
@@ -112,7 +103,7 @@ def load():
         for line in (8.5, 9.5, 10.5):
             name = "corners_o" + str(line).replace(".", "_")
             m[name] = np.where(m["total_corners"].notna(), (m["total_corners"] > line).astype(float), np.nan)
-        keep = ["match_id"] + [c for c in m.columns if c.startswith("corners_o")]
+        keep = ["match_id", "total_corners"] + [c for c in m.columns if c.startswith("corners_o")]
         df = df.merge(m[keep], on="match_id", how="left")
     except Exception as e:  # noqa: BLE001
         logging.warning("Korner hedefleri eklenemedi: %s", e)
@@ -136,8 +127,17 @@ def parse_args():
     p.add_argument("--date", default=None, help="YYYY-MM-DD (varsayılan: bugün)")
     p.add_argument("--tz", default="Europe/Istanbul", help="gün hesabı için saat dilimi")
     p.add_argument("--all", action="store_true", help="tüm oynanmamış maçları tahmin et")
+    p.add_argument("--top-n", type=int, default=120,
+                   help="her hedef için en önemli N özelliği tut (0 = seçim yapma)")
     args, _ = p.parse_known_args()  # Colab/Jupyter ek argümanlarına takılmasın
     return args
+
+
+def time_weights(dt, ref, half_life_days=365.0, floor=0.1):
+    """Yakın maçlara daha çok ağırlık: yaş (gün) arttıkça ağırlık yarılanır, en az `floor`.
+    dt: kickoff_dt sütunu (metin ya da tarih), ref: referans (genelde en yeni maç)."""
+    age = (pd.to_datetime(ref) - pd.to_datetime(dt)).dt.total_seconds().to_numpy() / 86400.0
+    return np.clip(0.5 ** (np.clip(age, 0, None) / half_life_days), floor, 1.0)
 
 
 def get_features(df):
@@ -149,17 +149,17 @@ def get_features(df):
     return feats
 
 
-def fit(X_tr, y_tr, k, X_va=None, y_va=None, rounds=None, w_tr=None):
+def fit(X_tr, y_tr, k, X_va=None, y_va=None, rounds=None):
     p = dict(PARAMS)
     if k == 2:
         p.update(objective="binary", metric="binary_logloss")
     else:
         p.update(objective="multiclass", num_class=k, metric="multi_logloss")
-    dtr = lgb.Dataset(X_tr, y_tr, weight=w_tr)
+    dtr = lgb.Dataset(X_tr, y_tr)
     if rounds is None:
         dva = lgb.Dataset(X_va, y_va, reference=dtr)
         return lgb.train(p, dtr, num_boost_round=3000, valid_sets=[dva],
-                         callbacks=[lgb.early_stopping(100, verbose=False)])
+                         callbacks=[lgb.early_stopping(EARLY_STOP, verbose=False)])
     return lgb.train(p, dtr, num_boost_round=rounds)
 
 
@@ -213,9 +213,14 @@ def main():
             logging.warning("%s atlandı: yetersiz satır", name)
             continue
 
-        kt = d["kickoff_dt"]
-        w_tr = time_weights(kt[tr], kt[tr].max())
-        model = fit(X[tr], y[tr], k, X[va], y[va], w_tr=w_tr)
+        cols = feats
+        if args.top_n and args.top_n < len(feats):
+            m0 = fit(X[tr][feats], y[tr], k, X[va][feats], y[va])  # yalnızca train+valid kullanılır
+            g = pd.Series(m0.feature_importance("gain"), index=feats).sort_values(ascending=False)
+            cols = list(g.index[:args.top_n])
+        X = d[cols]
+
+        model = fit(X[tr], y[tr], k, X[va], y[va])
         best = model.best_iteration
         P = proba(model, X[te], k)
 
@@ -226,23 +231,21 @@ def main():
         ll, ll0 = log_loss(y[te], P, labels=labels), log_loss(y[te], P0, labels=labels)
 
         results.append(dict(
-            hedef=name, sinif_sayisi=k, test_maci=int(te.sum()), iterasyon=best,
+            hedef=name, sinif_sayisi=k, test_maci=int(te.sum()), iterasyon=best, ozellik_sayisi=len(cols),
             logloss_model=round(ll, 4), logloss_temel=round(ll0, 4),
             skill=round(1 - ll / ll0, 4),
             brier_model=round(brier(y[te], P, k), 4), brier_temel=round(brier(y[te], P0, k), 4),
-            valid_logloss=round(next(iter(model.best_score["valid_0"].values())), 4),
         ))
         logging.info("%-16s k=%d iter=%4d | logloss %.4f vs temel %.4f | skill %+.2f%%",
                      name, k, best, ll, ll0, 100 * (1 - ll / ll0))
 
-        imp = pd.Series(model.feature_importance("gain"), index=feats).sort_values(ascending=False).head(25)
+        imp = pd.Series(model.feature_importance("gain"), index=cols).sort_values(ascending=False).head(25)
         importances.append(pd.DataFrame({"hedef": name, "ozellik": imp.index, "gain": imp.values}))
 
         # tahmin için: tüm bitmiş veriyle yeniden eğit
         if len(pred_rows):
-            w_all = time_weights(kt, kt.max())
-            final = fit(X, y, k, rounds=max(50, int(best * 1.15)), w_tr=w_all)
-            Pp = proba(final, pred_rows[feats], k)
+            final = fit(X, y, k, rounds=max(50, int(best * 1.15)))
+            Pp = proba(final, pred_rows[cols], k)
             for j, cls in enumerate(enc.classes_):
                 pred_out[f"{name}__{cls}"] = np.round(Pp[:, j], 4)
 
@@ -251,11 +254,9 @@ def main():
     if importances:
         pd.concat(importances).to_csv(DATA_DIR / "feature_importance.csv", index=False, encoding="utf-8-sig")
     if len(pred_rows):
-        stamp = datetime.now(ZoneInfo(args.tz)).strftime("%H%M")
-        pred_out.to_csv(DATA_DIR / f"predictions_{day}_{stamp}.csv", index=False, encoding="utf-8-sig")
         pred_out.to_csv(DATA_DIR / f"predictions_{day}.csv", index=False, encoding="utf-8-sig")
         pred_out.to_csv(DATA_DIR / "predictions_predict.csv", index=False, encoding="utf-8-sig")
-        logging.info("Tahminler yazıldı: predictions_%s_%s.csv", day, stamp)
+        logging.info("Tahminler yazıldı: predictions_%s.csv", day)
     print(res.to_string(index=False))
 
 
